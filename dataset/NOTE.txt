@@ -1,0 +1,7 @@
+[Country]_metadata_Alpha.xlsx
+
+	metadata with a 1-1 correspondance to items in the csv
+
+[Country]_#D.csv
+
+	new dataset achieved by multiplying the original dataset with respective [Country]_PCA_#Components.csv

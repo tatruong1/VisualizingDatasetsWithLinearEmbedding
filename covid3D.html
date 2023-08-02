@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Covid 3D</title>
+    <style>
+        body { margin: 0; }
+    </style>
+    <!-- load from CDN rather than local as it req. live server due to same origin policy while src="three.min.js" depreciated-->
+    <!--for three.js-->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+
+    <!--for parsing xlsx-->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.8.0/jszip.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.8.0/xlsx.js"></script>
+
+    <!--for datgui-->
+    <script type="text/javascript" src="dat.gui.js"></script>
+
+    <!--main three.js module & addon for OrbitControls-->
+    <script type="importmap">
+    {
+        "imports": {
+        "three": "https://unpkg.com/three@0.150.1/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.150.1/examples/jsm/" 
+        }
+    }
+    </script>
+</head>
+<body>
+    <!--topbar html & user inputs-->
+    <div style="display:flex; ">
+        <div>
+            <p>Metadata (.xlsx) Here FIRST</p>
+            <input type="file" id="meta-data-input" accept=".xlsx" style="width: 250px;">
+        </div>
+        <div>        
+            <p>Then .csv File Here</p>
+            <input type="file" id="file-selector" accept=".csv" style="width: 170px;">
+        </div>
+        <button class="togglePickMode" style="width:40px;">Click Mode</button>
+        <div style="display:flex; flex-direction: column;">
+            <div>X-Multiplier:<input type="text" id="inputX" value="1" style="width:40px; height:18px;"></div>
+            <div>Y-Multiplier:<input type="text" id="inputY" value="1" style="width:40px; height:18px;"></div>
+            <div>Z-Multiplier:<input type="text" id="inputZ" value="1" style="width:40px; height:18px;"></div>
+        </div>
+        <button class="changeXYZ" style="display:none">Enter</button>
+        <div style="display:flex; flex-direction: column;">
+            <div>Scale-X:<input type="text" id="scaleX" value="1" style="width:40px; height:18px;"></div>
+            <div>Scale-Y:<input type="text" id="scaleY" value="1" style="width:40px; height:18px;"></div>
+            <div>Scale-Z:<input type="text" id="scaleZ" value="1" style="width:40px; height:18px;"></div>
+        </div>
+        <button class="scalePoints" style="display:none">Enter</button>
+        <button class="reRotate" style="display:none; width:50px;">Rotate Points</button>
+        <button class="normalizeRotations" style="display:none; width:70px;">Normalize Rotations</button>
+        <button class="resetPoints" style="display:none;">Reset</button>
+        <button class="changeCameraRotation" style="display:none; width:60px;">Reset Camera</button>
+        <p class="camTip" style="display: none; width:70px; margin: 0px; word-wrap:break-word;">Press 'E' to set camera on select point</p>
+    </div>
+
+    <!--where the 3d is rendered-->
+    <canvas id="c"></canvas>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const PORTUGALCOUNT = 5587;
+        const ISRAELCOUNT = 5199;
+
+        /*detects button click, toggling hover/click*/
+        let hoverToggle = false;
+        const togglePickMode = document.querySelector(".togglePickMode");
+        togglePickMode.addEventListener("click", function() {
+            hoverToggle = !hoverToggle;
+            if(hoverToggle) {
+                togglePickMode.innerHTML = "Hover Mode";
+            } else {
+                togglePickMode.innerHTML = "Click Mode";
+            }
+        })
+
+        //i hate CORS & same origin policy
+        var csvFile;
+        var txt;
+        var csvArray = [[]];
+
+        /*METADATA INFORMATION
+            Ex: console.log(metaDataArray[0].gisaid_epi_isl);
+            strain
+
+            gisaid_epi_isl
+                'id' for that case of covid (?)
+            date
+                ranges from feb 2020 to apr 2021
+            GISAID_clade
+                O, GR, G, L, S, V, GH, GRY
+            WHO_variant
+                unassigned, Alpha, Beta, Gamma, Delta, Kappa, Iota, Zeta
+            pangolin_aliases
+                *more specific identifier than WHO_variant (generally all Alpha cases share the alias B.1.1.7 [some are B.1.1.7.4])
+                Common non-WHO variants:
+                    A.#, B.1.1, B.1.177.#, B.1.1.50, B.1.160, B.1.362, B.1.#
+        */
+        var metaFile;
+        var metaTxt;
+        var json_object;
+        var metaDataArray = [];
+
+        /*'template' json objects so they can initialized within our gui*/
+        const colorCode = `{
+            "Blue": "Alpha Variant",
+            "Red": "Beta Variant",
+            "Green": "Gamma Variant",
+            "Yellow": "Delta Variant",
+            "Light Yellow": "pangolin B.1.117.#",
+            "Light Green": "pangolin B.1.1.50",
+            "Forest Green": "pangolin B.1.362.#",
+            "Hot Pink": "pangolin B.1.160",
+            "Grey": "pangolin B.1.1.#",
+            "Light Grey": "pangolin B.1.#",
+            "Dark Grey": "pangolin B.#"
+        }`;
+        const colorCodeObj = JSON.parse(colorCode);
+
+        const matchPangolin = `{ "# Same pangolin_alias": 0 }`;
+        const matchPangolinObj = JSON.parse(matchPangolin);
+
+        const matchGisaid = `{ "# Same GISAID_clade": 0 }`;
+        const matchGisaidObj = JSON.parse(matchGisaid);
+
+        const matchAliasGisaid = `{ "# Same alias & GISAID": 0 }`;
+        const matchAliasGisaidObj = JSON.parse(matchAliasGisaid);
+
+        const matchDate = `{ "# Same Month/Yr": 0 }`;
+        const matchDateObj = JSON.parse(matchDate);
+
+        //reads in inputted file, should be [Country]_#D.csv here
+        var fileSelector = document.getElementById("file-selector");
+        fileSelector.addEventListener("change", (event) => {
+            csvFile = fileSelector.files[0];
+            console.log(csvFile);
+            readFile(csvFile);
+        });
+
+        //reads in file, should be [Country]_metadata_Alpha.xlsx here
+        var metadata = document.getElementById("meta-data-input");
+        metadata.addEventListener("change", (event) => {
+            metaFile = metadata.files[0];
+            console.log(metaFile);
+            readMetaData(metaFile);
+        });
+
+        //gui init, setup further down below
+        //allows for inputting 2nd dataset after the 1st without having to reload the page
+        let guiWidth = 350;
+        let gui = new dat.GUI({width:guiWidth});
+
+        //after reading in csv file, create and render the 3d
+        function readFile(file) {
+            const reader = new FileReader();
+            reader.addEventListener("load", (event) => {
+                //process csv
+                txt = event.target.result;
+                csvArray = CSVToArray(txt);
+                console.log(csvArray);
+
+                //check thru metadata & catalog characteristics
+                //initialize map entry if missing, increment if present
+                let pangolinMap = new Map();
+                let gisaidCladeMap = new Map();
+                let pangolinGidaidMap = new Map();
+                let dateMap = new Map();
+                for(let i = 0; i < metaDataArray.length; i++) {
+                    let val;
+                    if(!pangolinMap.has(metaDataArray[i].pangolin_aliases)) {
+                        pangolinMap.set(metaDataArray[i].pangolin_aliases, 1);
+                    } else {
+                        val = pangolinMap.get(metaDataArray[i].pangolin_aliases);
+                        pangolinMap.set(metaDataArray[i].pangolin_aliases, val+1);
+                    }
+                    if(!gisaidCladeMap.has(metaDataArray[i].GISAID_clade)) {
+                        gisaidCladeMap.set(metaDataArray[i].GISAID_clade, 1);
+                    } else {
+                        val = gisaidCladeMap.get(metaDataArray[i].GISAID_clade);
+                        gisaidCladeMap.set(metaDataArray[i].GISAID_clade, val+1);
+                    }
+                    if(!pangolinGidaidMap.has(metaDataArray[i].pangolin_aliases+metaDataArray[i].GISAID_clade)) {
+                        pangolinGidaidMap.set(metaDataArray[i].pangolin_aliases+metaDataArray[i].GISAID_clade, 1);
+                    } else {
+                        val = pangolinGidaidMap.get(metaDataArray[i].pangolin_aliases+metaDataArray[i].GISAID_clade);
+                        pangolinGidaidMap.set(metaDataArray[i].pangolin_aliases+metaDataArray[i].GISAID_clade, val+1);
+                    }
+                    val = metaDataArray[i].date.trim().split('/');
+                    let dateFormatted = val[0] + "/" + val[2];
+                    if(!dateMap.has(dateFormatted)) {
+                        dateMap.set(dateFormatted, 1);
+                    } else {
+                        val = dateMap.get(dateFormatted);
+                        dateMap.set(dateFormatted, val+1);
+                    }
+                }
+
+                console.log(pangolinGidaidMap);
+
+
+                //may need to multiply values as we're working w/ very small numbers
+                //multiply now handled thru user input, but still need to convert values in csv to ints
+                let multiplierX = 1;
+                let multiplierY = 1;
+                let multiplierZ = 1;
+
+                let avgX = 0;   let avgY = 0;   let avgZ = 0;
+                for(let i = 0; i < csvArray.length; i++) {
+                    if(csvArray[i].length < 3) {
+                        //converting csv to arr leaves a blank index at the end, need to trim off
+                        csvArray.splice(csvArray.indexOf(csvArray[i]), 1);
+                        continue;
+                    }
+                    csvArray[i][0] = Number(csvArray[i][0]) * multiplierX;
+                    csvArray[i][1] = Number(csvArray[i][1]) * multiplierY;
+                    csvArray[i][2] = Number(csvArray[i][2]) * multiplierZ;
+
+                    avgX += csvArray[i][0];
+                    avgY += csvArray[i][1];
+                    avgZ += csvArray[i][2];
+                }
+                avgX = avgX / csvArray.length;
+                avgY = avgY / csvArray.length;
+                avgZ = avgZ / csvArray.length;
+
+                ///*
+                //check for exact overlapping points
+                for(let i = 0; i < csvArray.length-1; i++) {
+                    let x = csvArray[i][0];
+                    let y = csvArray[i][1];
+                    let z = csvArray[i][2];
+                    for(let j = i+1; j < csvArray.length; j++) {
+                        if((x == csvArray[j][0]) && (y == csvArray[j][1]) && (z == csvArray[j][2])) {
+                            console.log("SHIFT POINT");
+                            //if overlapping, randomly shift 1 of the values slightly
+                            let shift = 0.033;
+
+                            let die = Math.floor(Math.random() * 3); //0-2
+                            let coin = Math.floor(Math.random() * 2); //0 or 1
+
+                            let negate = Math.floor(Math.random() * 2);
+                            if(negate == 0) { negate = -1; } else { negate = 1; }
+
+                            if(coin == 0) {
+                                switch(die) {
+                                    case 0: 
+                                        csvArray[i][0] += shift * negate;
+                                        break;
+                                    case 1: 
+                                        csvArray[i][1] += shift * negate;
+                                        break;
+                                    case 2: 
+                                        csvArray[i][2] += shift * negate;
+                                        break;
+                                    default:
+                                }
+                                //console.log("SHIFT L " + i + " FROM " + j);
+                            } else {
+                                switch(die) {
+                                    case 0: 
+                                        csvArray[j][0] += shift * negate;
+                                        break;
+                                    case 1: 
+                                        csvArray[j][1] += shift * negate;
+                                        break;
+                                    case 2: 
+                                        csvArray[j][2] += shift * negate;
+                                        break;
+                                    default:
+                                }
+                                //console.log("SHIFT R " + j + " FROM " + i);
+                            }
+                        }
+                    } 
+                }
+                //*/
+
+                //csv file inputted & processed, render threeJS scene here
+                //GUI ----------------------------------------
+                //init all gui entries; gui destroyed and replaced when loading in 2nd dataset
+                gui.destroy()
+                gui = new dat.GUI({width:guiWidth});
+                const pointStats = gui.addFolder('Selected Case Information');
+                const similarPoints = gui.addFolder('Numer of Points w/ same Characteristic (Including self)');
+                const colorKey = gui.addFolder('Significant Colors Key');
+
+                let controllerStrain = pointStats.add(metaDataArray[0], 'strain');
+                let controllerStrainId = pointStats.add(metaDataArray[0], 'gisaid_epi_isl');
+                let controllerDate = pointStats.add(metaDataArray[0], 'date');
+                let controllerWHO = pointStats.add(metaDataArray[0], 'WHO_variant');
+                let controllerAlias = pointStats.add(metaDataArray[0], 'pangolin_aliases');
+                let controllerGisaid = pointStats.add(metaDataArray[0], 'GISAID_clade');
+
+                let controllerMatchPangolin = similarPoints.add(matchPangolinObj,'# Same pangolin_alias');
+                let controllerMatchGisaid = similarPoints.add(matchGisaidObj, '# Same GISAID_clade');
+                let controllerMatchPangolinGisaid = similarPoints.add(matchAliasGisaidObj, '# Same alias & GISAID')
+                let controllerMatchDate = similarPoints.add(matchDateObj, '# Same Month/Yr')
+
+                //load different values into gui depending on dataset
+                if(csvArray.length == PORTUGALCOUNT) {
+                    colorKey.add(colorCodeObj, "Blue");
+                    colorKey.add(colorCodeObj, "Red");
+                    colorKey.add(colorCodeObj, "Green");
+                    colorKey.add(colorCodeObj, "Light Yellow");
+                    colorKey.add(colorCodeObj, "Hot Pink");
+                    colorKey.add(colorCodeObj, "Grey");
+                    colorKey.add(colorCodeObj, "Light Grey");
+                    colorKey.add(colorCodeObj, "Dark Grey");
+                } else { //ISRAELCOUNT
+                    colorKey.add(colorCodeObj, "Blue");
+                    colorKey.add(colorCodeObj, "Red");
+                    colorKey.add(colorCodeObj, "Yellow");
+                    colorKey.add(colorCodeObj, "Light Yellow");
+                    colorKey.add(colorCodeObj, "Light Green");
+                    colorKey.add(colorCodeObj, "Forest Green");
+                    colorKey.add(colorCodeObj, "Grey");
+                    colorKey.add(colorCodeObj, "Light Grey");
+                    colorKey.add(colorCodeObj, "Dark Grey");
+                }
+
+                //set gui values to generic values rather than point[0]
+                controllerStrain.setValue("hCoV-19/...");
+                controllerStrainId.setValue("EPI_ISL_...");
+                controllerDate.setValue("0/0/0");
+                controllerWHO.setValue("...");
+                controllerAlias.setValue("...");
+                controllerGisaid.setValue("...");
+                pointStats.open();
+                //GUI End----------------------------------------
+                //*/
+
+                //camera setup
+                const scene = new THREE.Scene();
+                const fov = 60;
+                const aspect = 2;  // the canvas default
+                const near = 0.1;
+                const far = 200;
+                const camera = new THREE.PerspectiveCamera( fov, aspect, near, far );
+
+                //pointIdArray[] inited up here as user inputs are dependent on it
+                let pointIdArray = [];
+
+                //allows user to modify spacing between points
+                const buttonDisplay = document.querySelector(".changeXYZ");
+                buttonDisplay.style.display = "block";
+                buttonDisplay.addEventListener("click", function() {
+                    let modX = document.getElementById("inputX").value;
+                    let modY = document.getElementById("inputY").value;
+                    let modZ = document.getElementById("inputZ").value;
+                    for(let i = 0; i < csvArray.length; i++) {
+                        let point = scene.getObjectById(pointIdArray[i]);
+                        point.position.x = csvArray[i][0] * modX;
+                        point.position.y = csvArray[i][1] * modY;
+                        point.position.z = csvArray[i][2] * modZ;
+                    }
+                });
+                //allows user to modify size of points
+                const scaleButton = document.querySelector(".scalePoints");
+                scaleButton.style.display = "block";
+                scaleButton.addEventListener("click", function() {
+                    let scaleX = document.getElementById("scaleX").value;
+                    let scaleY = document.getElementById("scaleY").value;
+                    let scaleZ = document.getElementById("scaleZ").value;
+                    for(let i = 0; i < csvArray.length; i++) {
+                        let point = scene.getObjectById(pointIdArray[i]);
+                        point.scale.x = scaleX;
+                        point.scale.y = scaleY;
+                        point.scale.z = scaleZ;
+                    }
+                });
+
+                //rotates points randomly in increments of 5 degrees (360/72 = 5)
+                const reRotate = document.querySelector(".reRotate");
+                reRotate.style.display = "block";
+                reRotate.addEventListener("click", function() {
+                    let degToRad = Math.PI / 180;
+                    for(let i = 0; i < csvArray.length; i++) {
+                        let point = scene.getObjectById(pointIdArray[i]);
+                        let rotateX = Math.floor(5*((Math.random()*72)+1));
+                        let rotateY = Math.floor(5*((Math.random()*72)+1));
+                        let rotateZ = Math.floor(5*((Math.random()*72)+1));
+                        point.rotation.x = rotateX * degToRad;
+                        point.rotation.y = rotateY * degToRad;
+                        point.rotation.z = rotateZ * degToRad;
+                    }
+                });
+
+                //resets rotations to 0
+                const normalizeRotations = document.querySelector(".normalizeRotations");
+                normalizeRotations.style.display = "block";
+                normalizeRotations.addEventListener("click", function() {
+                    for(let i = 0; i < csvArray.length; i++) {
+                        let point = scene.getObjectById(pointIdArray[i]);
+                        point.rotation.x = 0;
+                        point.rotation.y = 0;
+                        point.rotation.z = 0;
+                    }
+                });
+
+                //resets all modified values to their default 
+                //(excluding camera position as orbitControls messes with that)
+                const resetPoints = document.querySelector(".resetPoints");
+                resetPoints.style.display = "block";
+                resetPoints.addEventListener("click", function() {
+                    for(let i = 0; i < csvArray.length; i++) {
+                        let point = scene.getObjectById(pointIdArray[i]);
+                        point.rotation.x = 0;
+                        point.rotation.y = 0;
+                        point.rotation.z = 0;
+                        point.scale.x = 1;
+                        point.scale.y = 1;
+                        point.scale.z = 1;
+                        point.position.x = csvArray[i][0];
+                        point.position.y = csvArray[i][1];
+                        point.position.z = csvArray[i][2];
+                    }
+                });
+                
+                //Picker-------------------------------------------------------
+                //Picking objects w/ mouse
+                let pointId;
+                let markedPointId;
+                class pickHelper {
+                    constructor() {
+                        this.raycaster = new THREE.Raycaster();
+                        this.pickedObject = null;
+                        this.pickedObjectSavedColor = null;
+                    }
+                    pick(normalizedPosition, scene, camera) {
+                        //restore color if theres pickedObj (picked meaning mouse is hovering over it)
+                        if(this.pickedObject) {
+                            this.pickedObject.material.color.setHex(this.pickedObjectSavedColor);
+                            this.pickedObject = undefined;
+
+                            //theoretically cleans these up; not needed?
+                            document.removeEventListener("mousedown", document);
+                            document.removeEventListener("mouseup", document);
+                        }
+
+                        //cast ray thru frustum
+                        this.raycaster.setFromCamera(normalizedPosition, camera);
+                        //get list of objects touched by ray
+                        const intersectedObjects = this.raycaster.intersectObjects(scene.children);
+                        if(intersectedObjects.length) {
+                            //pick closest objecct if intersecting & save color (add .parent if edges finally work)
+                            this.pickedObject = intersectedObjects[0].object;
+                            this.pickedObjectSavedColor = this.pickedObject.material.color.getHex();
+                            this.pickedObject.material.color.setHex(0xffffff);
+
+                            //add to gui
+                            //MISMATCHING IDs HERE, MUST GET INDEX OF pointIDArray 
+                            //as pickedObject.id != pointIdArray[i];
+                            let pointer = this.pickedObject.id;
+                            pointId = pointIdArray.indexOf(pointer);
+
+                            let movementThreshold = 6;
+                            let startX;
+                            let startY;
+
+                            //changes values only on mouse click 
+                            //differentiates mouse dragging from clicking by seeing if mouse moved from position by threshold
+                            document.addEventListener("mousedown", (event) => {
+                                startX = event.pageX;
+                                startY = event.pageY;
+                            });
+                            document.addEventListener("mouseup", (event) => {
+                                const diffX = Math.abs(event.pageX - startX);
+                                const diffY = Math.abs(event.pageY - startY);
+
+                                if(diffX < movementThreshold && diffY < movementThreshold && !hoverToggle) {
+                                    setUIValues(metaDataArray[pointId]);                         
+                                    markedPointId = pointIdArray.indexOf(pointer);
+                                    //mouse click confirmed
+                                    //console.log("coord:"+camera.position.x + " " + camera.position.y + " " + camera.position.z);
+                                    //console.log("rot:"+camera.rotation.x+" "+camera.rotation.y + " "+camera.rotation.z);
+                                }
+                            });
+                            //or change values on mouse hover
+                            if(hoverToggle) {
+                                setUIValues(metaDataArray[pointId]);
+                                markedPointId = pointIdArray.indexOf(pointer);
+                            }
+                            //*/
+                            console.log("POINT SELECTED");
+                        }
+                    }
+                }
+                //changes values in gui based on metadata of pointer
+                function setUIValues(pointer) {
+                    controllerStrain.setValue(pointer.strain);
+                    controllerStrainId.setValue(pointer.gisaid_epi_isl);
+                    controllerDate.setValue(pointer.date);
+                    controllerWHO.setValue(pointer.WHO_variant);
+                    controllerAlias.setValue(pointer.pangolin_aliases);
+                    controllerGisaid.setValue(pointer.GISAID_clade);
+
+                    //also fetches counts from maps
+                    controllerMatchPangolin.setValue(pangolinMap.get(pointer.pangolin_aliases));
+                    controllerMatchGisaid.setValue(gisaidCladeMap.get(pointer.GISAID_clade));
+
+                    let output = pointer.pangolin_aliases + pointer.GISAID_clade;
+                    controllerMatchPangolinGisaid.setValue(pangolinGidaidMap.get(output));
+
+                    let tempDate = pointer.date.trim().split('/');
+                    output = tempDate[0] + "/" + tempDate[2];
+                    controllerMatchDate.setValue(dateMap.get(output));
+                }
+
+                //init picker
+                const pickPosition = {x:0,y:0};
+                const pickHelp = new pickHelper();
+                clearPickPosition();
+
+                function getCanvasRelativePosition(event) {
+                    const rect = canvas.getBoundingClientRect();
+                    return {
+                        x: (event.clientX - rect.left) * canvas.width  / rect.width,
+                        y: (event.clientY - rect.top ) * canvas.height / rect.height,
+                    };
+                }
+                
+                //frames where the ray is cast
+                function setPickPosition(event) {
+                    const pos = getCanvasRelativePosition(event);
+                    pickPosition.x = (pos.x / canvas.width ) *  2 - 1;
+                    pickPosition.y = (pos.y / canvas.height) * -2 + 1;  // note we flip Y
+                }
+                
+                function clearPickPosition() {
+                    //a position unlikely to pick up on anything
+                    pickPosition.x = -100000;
+                    pickPosition.y = -100000;
+                }
+                
+                window.addEventListener('mousemove', setPickPosition);
+                window.addEventListener('mouseout', clearPickPosition);
+                window.addEventListener('mouseleave', clearPickPosition);
+
+                //Picker End-------------------------------------------------------
+
+                //setup canvas & renderer
+                const canvas = document.querySelector('#c');
+                const renderer = new THREE.WebGLRenderer({antialias:true, canvas});
+                renderer.setSize( window.innerWidth, window.innerHeight );
+                document.body.appendChild( renderer.domElement );
+
+                //creating many distinct points
+                //setup what a point looks like
+                const cube = new THREE.BoxGeometry( 0.1, 0.1, 0.1 );
+
+                //initialize points, define materials, note ids
+                for(let i = 0; i < csvArray.length; i++) {
+                    if(csvArray[i].length < 2) { throw 'CSV FILE MUST BE [COUNTRY]_3D.csv for input'; }
+                    if(metaDataArray.length < 1) { throw 'metadata missing';}
+                    if(metaDataArray.length != csvArray.length) { throw 'metadata & csv mismatch'; }
+
+                    //COLORS DEFINED IN LOOP SO EACH OBJ HAS ITS OWN COLOR (IF DEFINED OUTSIDE, GROUPS OF POINTS
+                    //WILL BE ASSOCIATED TOGETHER)
+                    const blue = new THREE.Color(0x0000ff); //alpha
+                    const red = new THREE.Color(0xff0000); //beta
+                    const green = new THREE.Color(0x00fff00); //gamma
+                    const yellow = new THREE.Color(0xffff00); //delta
+                    const turqoise = new THREE.Color(0x00ffff); //epsilon
+                    const purple = new THREE.Color(0xff00ff); //kappa
+                    const skyblue = new THREE.Color(0xaaffff); //iota
+                    const pink = new THREE.Color(0xffaaff); //zeta
+
+                    const orange = new THREE.Color(0xff9933); //pangolinA
+                    const lightYellow = new THREE.Color(0xffffaa); //pangolinB117
+                    const lightGreen = new THREE.Color(0x66ff66); //pangolinB1150
+                    const hotPink = new THREE.Color(0xff3399); //pangolinB160
+                    const forestGreen = new THREE.Color(0x00cc99); //pangolinB1362
+                    const grey = new THREE.Color(0x808080); //pangolinB11
+                    const lightGrey = new THREE.Color(0xaaaaaa); //pangolinB1
+
+                    //MATERIALS DEFINED IN LOOP SO EACH OBJ HAS ITS OWN MATERIAL RATHER THAN GROUPS OF OBJECTS
+                    //SHARING A TYPE OF MATERIAL
+
+                    const material = new THREE.MeshBasicMaterial( {
+                        color: 0x333333, 
+                    });
+
+                    //generates point & note their id
+                    let point = new THREE.Mesh(cube, material);
+                    pointIdArray[i] = point.id;
+
+                    /*
+                    // edges (they break raycasting for some reason?)
+                    let geo = new THREE.EdgesGeometry( point.geometry ); // or WireframeGeometry
+                    let mat = new THREE.LineBasicMaterial( { color: 0x000000 } );
+                    let wireframe = new THREE.LineSegments( geo, mat );
+                    point.add( wireframe );
+                    //*/
+
+                    //assign colors based on WHO_variant & pangolin_alias
+                    ///*
+                    switch(metaDataArray[i].WHO_variant) {
+                        case "unassigned":
+                            let pangolinAlias = metaDataArray[i].pangolin_aliases;
+                            if(pangolinAlias.charAt(0) == 'A') {
+                                point.material.color = orange;
+                                //point.material = pangolinA;
+                            } else if (pangolinAlias.substring(0,7) == "B.1.177") {
+                                point.material.color = lightYellow;
+                                //point.material = pangolinB117; 
+                            } else if (pangolinAlias.substring(0,8) == "B.1.1.50") {
+                                point.material.color = lightGreen;
+                                //point.material = pangolinB1150;
+                            } else if (pangolinAlias.substring(0,7) == "B.1.160") {
+                                point.material.color = hotPink;
+                                //point.material = pangolinB160;
+                            } else if (pangolinAlias.substring(0,7) == "B.1.362") {
+                                point.material.color = forestGreen;
+                            } else if (pangolinAlias.substring(0,5) == "B.1.1") {
+                                point.material.color = grey;
+                            } else if (pangolinAlias.substring(0,3) == "B.1") {
+                                point.material.color = lightGrey;
+                            } //remaining points dark grey 0x333333
+                            break;
+                        case "Alpha":
+                            point.material.color = blue;
+                            break;
+                        case "Beta": 
+                            point.material.color = red;
+                            break;
+                        case "Gamma": 
+                            point.material.color = green;
+                            break;
+                        case "Delta": 
+                            point.material.color = yellow;
+                            break;
+                        case "Epsilon": 
+                            point.material.color = turqoise;
+                            break;
+                        case "Kappa": 
+                            point.material.color = purple;
+                            break;
+                        case "Iota": 
+                            point.material.color = skyblue;
+                            break;
+                        case "Zeta": 
+                            point.material.color = pink;
+                            break;
+                        default: 
+                    }
+                    //*/
+                    point.position.set(csvArray[i][0], csvArray[i][1], csvArray[i][2]);
+
+                    /*randomize rotations of the 'points'; not really needed since user can trigger rotations*/
+                    /*//
+                    let degToRad = Math.PI / 180;
+                    let rotateX = Math.floor(5*((Math.random()*72)+1));
+                    let rotateY = Math.floor(5*((Math.random()*72)+1));
+                    let rotateZ = Math.floor(5*((Math.random()*72)+1));
+
+                    point.rotation.x = rotateX * degToRad;
+                    point.rotation.y = rotateY * degToRad;
+                    point.rotation.z = rotateZ * degToRad;
+                    //*/
+
+                    scene.add(point);
+                }
+                //reference point
+                let temp = scene.getObjectById(pointIdArray[0]);
+                console.log(temp);
+
+                //bg color
+                const lightGrey = new THREE.Color(0xcccccc);
+                scene.background = lightGrey;
+
+                //Camera Controls ----------------------------------------
+                //hook camera into orbitControls
+                const controls = new OrbitControls( camera, renderer.domElement );
+                controls.mouseButtons = {
+                    LEFT: THREE.MOUSE.PAN,
+                    MIDDLE: THREE.MOUSE.DOLLY,
+                    RIGHT: THREE.MOUSE.ROTATE
+                }
+                //Allows the scene to read keyInputs
+                controls.listenToKeyEvents(document.body);
+                controls.keyPanSpeed = 25;
+                controls.keys = {
+                    LEFT: 'KeyA', 
+                    UP: 'KeyW', 
+                    RIGHT: 'KeyD', 
+                    BOTTOM: 'KeyS'
+                }
+                /*
+                Portugal cam pos 2.246145257858903 16.96158177255423 1.5123658685819104
+                Israel cam pos 9.854487909582751 15.355520988314767 1.9117159322401158
+                CAMERA CANNOT BE ROTATED MANUALLY WHEN USING OrbitControls
+                */
+                if(csvArray.length == PORTUGALCOUNT) {
+                    camera.position.set(2.24,16.96,1.51);
+                } else {
+                    camera.position.set(9.85,15.35,1.91);
+                }   
+                controls.target.set(avgX, avgY, avgZ);
+                controls.update() //called as we're changing positions manually
+
+                const changeCameraRotation = document.querySelector(".changeCameraRotation");
+                const camTip = document.querySelector(".camTip");
+                changeCameraRotation.style.display = "block";
+                camTip.style.display = "block";
+                changeCameraRotation.addEventListener("click", function() {
+                    controls.target.set(avgX, avgY, avgZ);
+                    controls.update()
+                });
+                window.onkeydown = function(keyInput) {
+                    //press 'E' to center camera around a marked point
+                    if(keyInput.keyCode == 69) {
+                        if(pointId) {
+                            let markedPoint = scene.getObjectById(pointIdArray[markedPointId]);
+                            controls.target.set(markedPoint.position.x, markedPoint.position.y, markedPoint.position.z);
+                            controls.update()
+                        }
+                    }
+                };
+
+                //Camera Controls End----------------------------------------
+                
+                //renderer loop
+                function render() {
+                    //using the picker
+                    pickHelp.pick(pickPosition, scene, camera);
+                    renderer.render( scene, camera );
+                    requestAnimationFrame( render );
+                }
+                requestAnimationFrame( render );
+                //render();
+            });
+            //call the reader so all the above actually executes
+            reader.readAsText(csvFile);
+        }
+        //reads in xlsx file here
+        function readMetaData(file) {
+            const metaReader = new FileReader();
+            metaReader.addEventListener("load", (event) => {
+                metaTxt = event.target.result;
+                var convertXLS = XLSX.read(metaTxt,{type: 'binary'});
+                //converts xlsx to jsonObj
+                convertXLS.SheetNames.forEach(function(sheetName) {
+                    // Here is your object
+                    var XL_row_object = XLSX.utils.sheet_to_row_object_array(convertXLS.Sheets[sheetName]);
+                    json_object = JSON.stringify(XL_row_object);
+                    console.log(json_object);
+                });
+                metaDataArray = JSON.parse(json_object);
+                console.log(metaDataArray);
+            });
+            metaReader.readAsBinaryString(file);
+        }
+        //csv to array[[]]
+        function CSVToArray( strData, strDelimiter ){
+            // Check to see if the delimiter is defined. If not,
+            // then default to comma.
+            strDelimiter = (strDelimiter || ",");
+
+            // Create a regular expression to parse the CSV values.
+            var objPattern = new RegExp((
+                // Delimiters.
+                "(\\" + strDelimiter + "|\\r?\\n|\\r|^)" +
+                // Quoted fields.
+                "(?:\"([^\"]*(?:\"\"[^\"]*)*)\"|" +
+                // Standard fields.
+                "([^\"\\" + strDelimiter + "\\r\\n]*))"),"gi"
+                );
+
+            // Create an array to hold our data. Give the array
+            // a default empty first row.
+            var arrData = [[]];
+            // Create an array to hold our individual pattern
+            // matching groups.
+            var arrMatches = null;
+
+            // Keep looping over the regular expression matches
+            // until we can no longer find a match.
+            while (arrMatches = objPattern.exec( strData )){
+
+                // Get the delimiter that was found.
+                var strMatchedDelimiter = arrMatches[ 1 ];
+
+                // Check to see if the given delimiter has a length
+                // (is not the start of string) and if it matches
+                // field delimiter. If id does not, then we know
+                // that this delimiter is a row delimiter.
+                if ( strMatchedDelimiter.length &&
+                    (strMatchedDelimiter != strDelimiter)) {
+                    // Since we have reached a new row of data,
+                    // add an empty row to our data array.
+                    arrData.push( [] );
+                }
+                // Now that we have our delimiter out of the way,
+                // let's check to see which kind of value we
+                // captured (quoted or unquoted).
+                if (arrMatches[ 2 ]) {
+                    // We found a quoted value. When we capture
+                    // this value, unescape any double quotes.
+                    var strMatchedValue = arrMatches[ 2 ].replace(new RegExp( "\"\"", "g" ),"\"");
+                } else {
+                    // We found a non-quoted value.
+                    var strMatchedValue = arrMatches[ 3 ];
+                }
+                // Now that we have our value string, let's add
+                // it to the data array.
+                arrData[ arrData.length - 1 ].push( strMatchedValue );
+            }
+            // Return the parsed data.
+            return( arrData );
+        }
+    </script>
+</body>
+</html>
